@@ -1,6 +1,8 @@
 # Guardrails for Hermes
 
-Hard spend limits for Hermes Agent, enforced in code before any payment tool runs.
+The policy layer every payment plugin is missing: hard spend limits for Hermes Agent, enforced in code before any payment tool runs.
+
+Guardrails is backend-neutral. It ships its own `guardrails_pay` tool, and it can sit in front of any other plugin's spending tool through `guarded_tools`. Wallet plugins can carry their own rules (MetaMask's Guard Mode, for example, edits the policy of that one wallet). Guardrails applies one set of caps, approvals, dedup and audit across every spending tool in the profile, whichever backend it talks to.
 
 An agent that can pay for things will sooner or later try to overspend, pay someone new, or retry a payment that already went through. Guardrails sits in Hermes's `pre_tool_call` hook, so the decision is made before the tool executes, and the model cannot talk its way past it.
 
@@ -116,11 +118,17 @@ python -m pytest -c tests/pytest.ini --rootdir tests tests
 
 `scripts/capture_demo.py` drives a real Hermes session end to end and regenerates the screenshots.
 
+## Approvals and unattended runs
+
+Guardrails never answers an approval itself. It returns Hermes's `approve` directive from `pre_tool_call`, and Hermes runs its own gate (`request_tool_approval`): the CLI/TUI/Desktop prompt, gateway buttons, the session and permanent allowlists, and its timeout. Any approval surface that plugs into that gate applies too; integration with ntfy-approval has not been tested. When nobody can answer (cron, `--oneshot`, a timed-out prompt), Hermes's gate blocks the payment. Guardrails itself never waits.
+
 ## Disclosure
 
 - Registers a `pre_tool_call` hook that sees every tool call but only acts on `guardrails_pay` and tools you list in `guarded_tools`, and a `post_tool_call` hook that settles those tools' reservations.
 - Writes payments and audit entries to `$HERMES_HOME/plugin-data/guardrails/guardrails.db`. Nothing else is read or written outside that directory.
-- Network: none with the `mock` backend. With `stripe_test`, payment requests go to `api.stripe.com` using your test key.
+- Network: none with the `mock` backend. With `stripe_test`, each payment sends amount, currency, payee, memo and the idempotency key to `api.stripe.com`, authenticated with your test key.
+- Credentials: the Stripe test key is read only through `agent.secret_scope.get_secret("GUARDRAILS_STRIPE_TEST_KEY")`. The plugin never reads `.env` or other credential files and stores no credentials.
+- Stored data: payee names, amounts, currency, idempotency keys, approval outcome, backend receipt ids and error text, in its own SQLite file. Nothing is sent anywhere.
 - No shell commands, background processes, telemetry, or self-updating code. No Python dependencies.
 
 ## Limits
