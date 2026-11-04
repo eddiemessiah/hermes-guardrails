@@ -1,0 +1,29 @@
+name: guardrails
+version: 0.1.0
+manifest_version: 2
+api_version: 1
+description: Hard spend limits for Hermes, enforced in code before any payment tool runs. Caps, human approval, no double charges, hash-chained audit log, kill switch.
+author: Edidiong Umana
+license: MIT
+homepage: https://github.com/eddiemessiah/hermes-guardrails
+tags: [payments, safety, guardrails, audit]
+requires_hermes: ">=0.21.5"
+provides_tools:
+  - guardrails_pay
+  - guardrails_status
+  - guardrails_audit
+provides_hooks:
+  - pre_tool_call
+  - post_tool_call
+config_schema:
+  currency: {type: str, default: usd, description: "3-letter currency all limits are in"}
+  per_payment_cap: {type: str, default: "50.00", label: "Per-payment cap", description: "Largest single payment allowed"}
+  daily_cap: {type: str, default: "200.00", label: "Daily cap", description: "Total allowed per UTC day across all payees"}
+  per_merchant_daily_cap: {type: str, default: "100.00", label: "Per-payee daily cap"}
+  approval_threshold: {type: str, default: "25.00", label: "Ask me above", description: "Payments above this pause for human approval"}
+  approve_new_payees: {type: bool, default: true, label: "Ask before paying a new payee"}
+  blocked_payees: {type: list, default: [], description: "Payees that are always refused"}
+  allowed_payees: {type: list, default: [], description: "If set, only these payees can be paid"}
+  guarded_tools: {type: dict, default: {}, description: "Other plugins' spending tools to put behind the same policy, e.g. {send_payment: {amount: amount, payee: to}}"}
+  backend: {type: str, choices: [mock, stripe_test], default: mock, description: "mock needs no keys; stripe_test needs a Stripe TEST key"}
+  stripe_test_key: {type: secret, env: GUARDRAILS_STRIPE_TEST_KEY, required: false, description: "Stripe test-mode secret key (sk_test_...). Live keys are refused."}
