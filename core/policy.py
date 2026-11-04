@@ -115,7 +115,7 @@ class LedgerView:
     spent_today: int
     spent_today_payee: int
     payee_known: bool
-    key_status: str | None  # None | "reserved" | "settled" | "failed"
+    key_status: str | None  # None | "pending" | "reserved" | "charging" | "settled"
 
 
 @dataclass(frozen=True)
@@ -143,7 +143,7 @@ def decide(req: Request, cfg: Config, view: LedgerView) -> Decision:
         return Decision("block", "frozen", "Guardrails kill switch is ON. All spending is frozen until a human runs /guardrails unfreeze.")
     if view.key_status == "settled":
         return Decision("replay", "duplicate", f"Duplicate of an already-settled payment ({req.key}). No new charge.")
-    if view.key_status == "reserved":
+    if view.key_status in ("reserved", "charging"):
         return Decision("block", "in_flight", f"A payment with the same idempotency key ({req.key}) is already in flight. Not retrying.")
     if req.currency != cfg.currency:
         return Decision("block", "currency", f"Only {cur.upper()} is allowed; got {req.currency.upper()}.")

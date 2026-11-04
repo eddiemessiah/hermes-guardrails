@@ -31,7 +31,8 @@ def env(tmp_path):
     ledger = Ledger(tmp_path / "g.db", clock=clock)
     backend = CountingBackend()
     cfg = {"guarded_tools": {"wallet_send": {"amount": "value", "payee": "to"}}}
-    return Guard(ledger, lambda: cfg, lambda: backend), backend, clock, cfg
+    yield Guard(ledger, lambda: cfg, lambda: backend), backend, clock, cfg
+    ledger.close()
 
 
 def run(g, args, tool="guardrails_pay"):
@@ -170,6 +171,7 @@ def test_tamper_detected(env, tmp_path):
     db.execute("DELETE FROM audit WHERE seq=3")
     db.commit()
     assert not g.ledger.verify()["ok"]
+    db.close()
 
 
 def test_stripe_refuses_live_keys():
@@ -184,3 +186,24 @@ def test_status_shape(env):
     run(g, {"payee": "acme", "amount": "7.25"})
     s = g.status()
     assert s["spent_today"] == "7.25 USD" and s["left_today"] == "192.75 USD" and s["audit"]["ok"]
+
+
+def test_unanswered_approval_asks_again_on_retry(env):
+    g, b, _, _ = env
+    args = {"payee": "new-vendor", "amount": "30", "idempotency_key": "r1"}
+    assert g.pre_tool_call("guardrails_pay", args, "s")["action"] == "approve"  # denied: handler never runs
+    d = g.pre_tool_call("guardrails_pay", args, "s")
+    assert d["action"] == "approve"  # asked again, not stuck as in-flight
+    assert g.ledger.totals()["total"] == 3000  # counted once, not twice
+    assert g.pay(args)["ok"] and b.calls == 1
+
+
+def test_parallel_handlers_charge_once(env):
+    g, b, _, _ = env
+    args = {"payee": "acme", "amount": "5", "idempotency_key": "p1"}
+    g.pre_tool_call("guardrails_pay", args, "s")
+    out = []
+    ts = [threading.Thread(target=lambda: out.append(g.pay(args))) for _ in range(8)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert b.calls == 1 and sum(1 for r in out if r.get("ok") and not r.get("duplicate")) == 1

@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS audit (
   prev TEXT NOT NULL, hash TEXT NOT NULL);
 """
 
-LIVE = ("reserved", "settled")
+LIVE = ("reserved", "charging", "settled")
 
 
 def _canon(obj) -> str:
@@ -51,6 +51,10 @@ class Ledger:
         self._db = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None)
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.executescript(_SCHEMA)
+
+    def close(self) -> None:
+        with self._lock:
+            self._db.close()
 
     # -- plumbing -----------------------------------------------------------
     @contextmanager
@@ -88,7 +92,8 @@ class Ledger:
 
     # -- kill switch --------------------------------------------------------
     def frozen(self, db=None) -> bool:
-        row = (db or self._db).execute("SELECT v FROM kv WHERE k='frozen'").fetchone()
+        with self._lock:
+            row = (db or self._db).execute("SELECT v FROM kv WHERE k='frozen'").fetchone()
         return bool(row and row[0] == "1")
 
     def set_frozen(self, on: bool, actor: str) -> None:
@@ -100,15 +105,21 @@ class Ledger:
     def view(self, db, payee: str, key: str) -> LedgerView:
         self._expire(db)
         d = self.day()
-        q = "SELECT COALESCE(SUM(amount),0) FROM payments WHERE day=? AND status IN ('reserved','settled')"
-        spent = db.execute(q, (d,)).fetchone()[0]
-        spent_p = db.execute(q + " AND payee=?", (d, payee)).fetchone()[0]
+        q = "SELECT COALESCE(SUM(amount),0) FROM payments WHERE day=? AND status IN ('reserved','charging','settled') AND key<>?"
+        spent = db.execute(q, (d, key)).fetchone()[0]
+        spent_p = db.execute(q + " AND payee=?", (d, key, payee)).fetchone()[0]
         known = db.execute("SELECT 1 FROM payments WHERE payee=? AND status='settled' LIMIT 1", (payee,)).fetchone() is not None
-        row = db.execute("SELECT status FROM payments WHERE key=?", (key,)).fetchone()
+        row = db.execute("SELECT status, approved_by FROM payments WHERE key=?", (key,)).fetchone()
         status = row[0] if row and row[0] in LIVE else None
+        if status == "reserved" and row[1] == "pending":
+            status = "pending"  # approval was asked but never answered yes: ask again
         return LedgerView(self.frozen(db), spent, spent_p, known, status)
 
     def payment(self, key: str):
+        with self._lock:
+            return self._u_payment(key)
+
+    def _u_payment(self, key: str):
         row = self._db.execute("SELECT key,tool,payee,amount,currency,status,approved_by,result FROM payments WHERE key=?", (key,)).fetchone()
         if not row:
             return None
@@ -118,16 +129,28 @@ class Ledger:
         return out
 
     def totals(self) -> dict:
+        with self._lock:
+            return self._u_totals()
+
+    def _u_totals(self) -> dict:
         d = self.day()
         rows = self._db.execute(
-            "SELECT payee, SUM(amount) FROM payments WHERE day=? AND status IN ('reserved','settled') GROUP BY payee", (d,)).fetchall()
+            "SELECT payee, SUM(amount) FROM payments WHERE day=? AND status IN ('reserved','charging','settled') GROUP BY payee", (d,)).fetchall()
         return {"day": d, "by_payee": {p: a for p, a in rows}, "total": sum(a for _, a in rows)}
 
     def entries(self, limit: int = 20) -> list[dict]:
+        with self._lock:
+            return self._u_entries(limit)
+
+    def _u_entries(self, limit: int = 20) -> list[dict]:
         rows = self._db.execute("SELECT seq, ts, event, data, hash FROM audit ORDER BY seq DESC LIMIT ?", (limit,)).fetchall()
         return [{"seq": s, "ts": t, "event": e, "data": json.loads(d), "hash": h[:12]} for s, t, e, d, h in reversed(rows)]
 
     def verify(self) -> dict:
+        with self._lock:
+            return self._u_verify()
+
+    def _u_verify(self) -> dict:
         prev, n = GENESIS, 0
         for seq, ts, event, data, p, h in self._db.execute("SELECT seq, ts, event, data, prev, hash FROM audit ORDER BY seq"):
             n += 1
@@ -144,9 +167,17 @@ class Ledger:
             "ON CONFLICT(key) DO UPDATE SET status='reserved', amount=excluded.amount, day=excluded.day, approved_by=excluded.approved_by, updated=excluded.updated",
             (key, tool, payee, amount, currency, self.day(), approved_by, now, now))
 
-    def mark_approved(self, key: str, by: str) -> None:
+    def claim(self, key: str):
+        """Atomically move a reservation to 'charging'. Returns the prior row, or None if not claimable."""
         with self.tx() as db:
-            db.execute("UPDATE payments SET approved_by=?, updated=? WHERE key=? AND status='reserved'", (by, self._clock(), key))
+            row = db.execute("SELECT status, approved_by FROM payments WHERE key=?", (key,)).fetchone()
+            if not row or row[0] != "reserved":
+                return row
+            by = "human" if row[1] == "pending" else row[1]
+            db.execute("UPDATE payments SET status='charging', approved_by=?, updated=? WHERE key=?", (by, self._clock(), key))
+            if row[1] == "pending":
+                self._append(db, "approved", {"key": key, "by": "human"})
+            return ("claimed", by)
 
     def settle(self, key: str, result: dict) -> None:
         with self.tx() as db:
@@ -155,6 +186,6 @@ class Ledger:
 
     def fail(self, key: str, error: str) -> None:
         with self.tx() as db:
-            db.execute("UPDATE payments SET status='failed', result=?, updated=? WHERE key=? AND status='reserved'",
+            db.execute("UPDATE payments SET status='failed', result=?, updated=? WHERE key=? AND status IN ('reserved','charging')",
                        (_canon({"error": error[:300]}), self._clock(), key))
             self._append(db, "failed", {"key": key, "error": error[:300]})

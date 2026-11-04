@@ -80,12 +80,15 @@ class Guard:
         if existing and existing["status"] == "settled":
             return {"ok": True, "duplicate": True, "note": "Already paid; returning the original receipt. No new charge.",
                     "receipt": existing["result"]}
-        if not existing or existing["status"] != "reserved":
+        claim = self.ledger.claim(req.key)
+        if not claim or claim[0] != "claimed":
+            if claim and claim[0] == "settled":
+                return {"ok": True, "duplicate": True, "note": "Already paid; returning the original receipt. No new charge.",
+                        "receipt": self.ledger.payment(req.key)["result"]}
+            if claim and claim[0] == "charging":
+                return {"ok": False, "blocked": True, "error": "This payment is already being charged. Not charging twice."}
             # Called without the pre_tool_call gate (should not happen inside Hermes): fail closed.
             return {"ok": False, "blocked": True, "error": "No policy reservation for this payment. Guardrails refuses to spend outside its gate."}
-        if existing["approved_by"] == "pending":
-            self.ledger.mark_approved(req.key, "human")
-            self.ledger.audit("approved", {"key": req.key, "by": "human"})
         try:
             receipt = self._get_backend().charge(key=req.key, payee=req.payee, amount=req.amount,
                                                  currency=req.currency, memo=req.memo)
@@ -109,6 +112,8 @@ class Guard:
         row = self.ledger.payment(req.key)
         if not row or row["status"] != "reserved":
             return
+        if row["approved_by"] == "pending":
+            self.ledger.audit("approved", {"key": req.key, "by": "human"})
         text = result if isinstance(result, str) else json.dumps(result, default=str)
         try:
             parsed = json.loads(text)
